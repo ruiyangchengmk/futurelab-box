@@ -1,0 +1,758 @@
+const express = require('express');
+const multer = require('multer');
+const cors = require('cors');
+const path = require('path');
+const fs = require('fs');
+const crypto = require('crypto');
+
+const app = express();
+const PORT = 8080;
+const MAX_STORAGE = 10 * 1024 * 1024 * 1024; // 10GB
+const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB per chunk
+const ACCESS_PASSWORD = 'byd123'; // 访问密码
+
+// 获取已用空间
+function getUsedSpace() {
+  const uploadsDir = path.join(__dirname, 'uploads');
+  if (!fs.existsSync(uploadsDir)) return 0;
+  
+  const files = fs.readdirSync(uploadsDir);
+  let totalSize = 0;
+  for (const file of files) {
+    const stats = fs.statSync(path.join(uploadsDir, file));
+    totalSize += stats.size;
+  }
+  return totalSize;
+}
+
+// 检查剩余空间
+function hasSpace(fileSize) {
+  return (getUsedSpace() + fileSize) <= MAX_STORAGE;
+}
+
+// 格式化文件大小
+function formatSize(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(2) + ' KB';
+  if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
+  return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+}
+
+// 配置存储
+const storage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    const uploadDir = path.join(__dirname, 'uploads');
+    if (!fs.existsSync(uploadDir)) {
+      fs.mkdirSync(uploadDir, { recursive: true });
+    }
+    cb(null, uploadDir);
+  },
+  filename: function (req, file, cb) {
+    // 使用原始文件名，添加时间戳避免冲突
+    const uniqueName = Date.now() + '-' + file.originalname;
+    cb(null, uniqueName);
+  }
+});
+
+const upload = multer({ 
+  storage: storage,
+  limits: { fileSize: 2 * 1024 * 1024 * 1024 } // 2GB
+});
+
+// 登录页面
+app.get('/login', (req, res) => {
+  const html = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FUTURELAB SHARING BOX - 登录</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { 
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+      min-height: 100vh;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      color: #fff;
+    }
+    .login-box {
+      background: rgba(255,255,255,0.05);
+      border: 2px solid #00d9ff;
+      border-radius: 16px;
+      padding: 40px;
+      text-align: center;
+      width: 100%;
+      max-width: 400px;
+    }
+    h1 { 
+      margin-bottom: 10px; 
+      font-size: 1.8em;
+      background: linear-gradient(90deg, #00d9ff, #00ff88);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    p { color: #888; margin-bottom: 30px; }
+    input[type="password"] {
+      width: 100%;
+      padding: 15px;
+      border: 2px solid #333;
+      border-radius: 10px;
+      background: rgba(255,255,255,0.05);
+      color: #fff;
+      font-size: 16px;
+      margin-bottom: 20px;
+      outline: none;
+      transition: border-color 0.3s;
+    }
+    input[type="password"]:focus {
+      border-color: #00d9ff;
+    }
+    button {
+      background: linear-gradient(90deg, #00d9ff, #00ff88);
+      color: #1a1a2e;
+      padding: 15px 40px;
+      border: none;
+      border-radius: 30px;
+      cursor: pointer;
+      font-weight: bold;
+      font-size: 16px;
+      width: 100%;
+      transition: transform 0.2s;
+    }
+    button:hover { transform: scale(1.02); }
+    .error {
+      color: #ff6b6b;
+      margin-top: 15px;
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="login-box">
+    <h1>🔐 FUTURELAB</h1>
+    <p>请输入访问密码</p>
+    <form id="loginForm">
+      <input type="password" id="password" placeholder="请输入密码" required>
+      <button type="submit">进入</button>
+    </form>
+    <p class="error" id="error">密码错误，请重试</p>
+  </div>
+  <script>
+    document.getElementById('loginForm').addEventListener('submit', (e) => {
+      e.preventDefault();
+      const password = document.getElementById('password').value;
+      if (password === '${ACCESS_PASSWORD}') {
+        // 记住登录状态 (24小时)
+        document.cookie = 'authorized=true; max-age=' + (24*60*60) + '; path=/';
+        location.href = '/';
+      } else {
+        document.getElementById('error').style.display = 'block';
+      }
+    });
+  </script>
+</body>
+</html>`;
+  res.send(html);
+});
+
+// 检查登录状态
+function isAuthorized(req) {
+  return req.cookies && req.cookies.authorized === 'true';
+}
+
+// 需要 cookie-parser
+const cookieParser = require('cookie-parser');
+app.use(cookieParser());
+app.use(cors());
+app.use(express.static('public'));
+app.use('/uploads', express.static('uploads'));
+
+// ========== 断点续传接口 (需要登录) ==========
+
+// 验证登录中间件
+function requireAuth(req, res, next) {
+  if (!req.cookies || req.cookies.authorized !== 'true') {
+    return res.status(401).json({ error: '请先登录' });
+  }
+  next();
+}
+
+// 获取已上传的分片
+app.get('/chunks/:fileId', requireAuth, (req, res) => {
+  const { fileId } = req.params;
+  const chunksDir = path.join(__dirname, 'chunks', fileId);
+  
+  if (!fs.existsSync(chunksDir)) {
+    return res.json({ chunks: [] });
+  }
+  
+  const files = fs.readdirSync(chunksDir);
+  const chunks = files.map(f => parseInt(f)).filter(n => !isNaN(n)).sort((a, b) => a - b);
+  
+  res.json({ chunks });
+});
+
+// 上传分片
+app.post('/chunks/:fileId/:chunkIndex', requireAuth, (req, res) => {
+  const { fileId, chunkIndex } = req.params;
+  const chunksDir = path.join(__dirname, 'chunks', fileId);
+  
+  // 创建分片目录
+  if (!fs.existsSync(chunksDir)) {
+    fs.mkdirSync(chunksDir, { recursive: true });
+  }
+  
+  const chunkPath = path.join(chunksDir, chunkIndex);
+  
+  // 写入分片
+  const writeStream = fs.createWriteStream(chunkPath);
+  
+  req.on('data', (chunk) => {
+    writeStream.write(chunk);
+  });
+  
+  req.on('end', () => {
+    writeStream.end();
+    res.json({ success: true, chunkIndex: parseInt(chunkIndex) });
+  });
+  
+  req.on('error', (err) => {
+    res.status(500).json({ error: err.message });
+  });
+});
+
+// 合并分片
+app.post('/merge/:fileId/:fileName', requireAuth, (req, res) => {
+  const { fileId, fileName } = req.params;
+  const chunksDir = path.join(__dirname, 'chunks', fileId);
+  const finalDir = path.join(__dirname, 'uploads');
+  
+  if (!fs.existsSync(chunksDir)) {
+    return res.status(400).json({ error: '分片不存在' });
+  }
+  
+  // 获取所有分片
+  const files = fs.readdirSync(chunksDir);
+  const chunkIndexes = files.map(f => parseInt(f)).filter(n => !isNaN(n)).sort((a, b) => a - b);
+  
+  if (chunkIndexes.length === 0) {
+    return res.status(400).json({ error: '没有分片' });
+  }
+  
+  // 计算总大小
+  let totalSize = 0;
+  for (const idx of chunkIndexes) {
+    const stats = fs.statSync(path.join(chunksDir, idx.toString()));
+    totalSize += stats.size;
+  }
+  
+  // 检查空间
+  if (!hasSpace(totalSize)) {
+    // 清理分片
+    fs.rmSync(chunksDir, { recursive: true });
+    return res.status(507).json({ error: '存储空间不足' });
+  }
+  
+  // 生成最终文件名
+  const timestamp = Date.now();
+  const safeName = fileName.replace(/[^a-zA-Z0-9.\-_]/g, '_');
+  const finalFileName = `${timestamp}-${safeName}`;
+  const finalPath = path.join(finalDir, finalFileName);
+  
+  // 合并分片
+  const writeStream = fs.createWriteStream(finalPath);
+  
+  let currentIndex = 0;
+  
+  function writeNextChunk() {
+    if (currentIndex >= chunkIndexes.length) {
+      writeStream.end();
+      // 清理分片目录
+      fs.rmSync(chunksDir, { recursive: true });
+      return res.json({ success: true, filename: finalFileName, size: totalSize });
+    }
+    
+    const chunkPath = path.join(chunksDir, chunkIndexes[currentIndex].toString());
+    const readStream = fs.createReadStream(chunkPath);
+    
+    readStream.pipe(writeStream, { end: false });
+    
+    readStream.on('end', () => {
+      currentIndex++;
+      writeNextChunk();
+    });
+    
+    readStream.on('error', (err) => {
+      writeStream.end();
+      res.status(500).json({ error: '合并失败: ' + err.message });
+    });
+  }
+  
+  writeNextChunk();
+});
+
+// 取消上传
+app.delete('/chunks/:fileId', requireAuth, (req, res) => {
+  const { fileId } = req.params;
+  const chunksDir = path.join(__dirname, 'chunks', fileId);
+  
+  if (fs.existsSync(chunksDir)) {
+    fs.rmSync(chunksDir, { recursive: true });
+  }
+  
+  res.json({ success: true });
+});
+
+// ========== 原有接口 ==========
+
+// 主页 - 显示文件列表和上传表单 (需要登录)
+app.get('/', (req, res) => {
+  // 检查登录状态
+  const isLoggedIn = req.cookies && req.cookies.authorized === 'true';
+  if (!isLoggedIn) {
+    return res.redirect('/login');
+  }
+  const uploadsDir = path.join(__dirname, 'uploads');
+  if (!fs.existsSync(uploadsDir)) {
+    fs.mkdirSync(uploadsDir, { recursive: true });
+  }
+  
+  const files = fs.readdirSync(uploadsDir).map(file => {
+    const stats = fs.statSync(path.join(uploadsDir, file));
+    return {
+      name: file,
+      size: (stats.size / 1024).toFixed(2) + ' KB',
+      sizeBytes: stats.size,
+      date: stats.mtime.toLocaleString('zh-CN'),
+      url: `/uploads/${encodeURIComponent(file)}`
+    };
+  });
+  
+  const usedSpace = getUsedSpace();
+  const remainingSpace = MAX_STORAGE - usedSpace;
+  
+  const html = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FUTURELAB SHARING BOX</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { 
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+      min-height: 100vh;
+      color: #fff;
+      padding: 40px 20px;
+    }
+    .container { max-width: 800px; margin: 0 auto; }
+    h1 { 
+      text-align: center; 
+      margin-bottom: 10px; 
+      font-size: 2.5em;
+      background: linear-gradient(90deg, #00d9ff, #00ff88);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    .subtitle { 
+      text-align: center; 
+      color: #888; 
+      margin-bottom: 40px; 
+    }
+    .storage-info {
+      background: rgba(255,255,255,0.05);
+      border-radius: 12px;
+      padding: 15px 20px;
+      margin-bottom: 20px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .storage-bar {
+      flex: 1;
+      height: 8px;
+      background: rgba(255,255,255,0.1);
+      border-radius: 4px;
+      margin: 0 15px;
+      overflow: hidden;
+    }
+    .storage-bar-fill {
+      height: 100%;
+      background: linear-gradient(90deg, #00d9ff, #00ff88);
+      border-radius: 4px;
+      transition: width 0.3s;
+    }
+    .upload-box {
+      background: rgba(255,255,255,0.05);
+      border: 2px dashed #00d9ff;
+      border-radius: 16px;
+      padding: 40px;
+      text-align: center;
+      margin-bottom: 40px;
+      transition: all 0.3s;
+    }
+    .upload-box:hover { background: rgba(0,217,255,0.1); }
+    .upload-box.disabled { 
+      opacity: 0.5; 
+      pointer-events: none;
+      border-color: #666;
+    }
+    .upload-box input[type="file"] { 
+      opacity: 0; 
+      position: absolute; 
+      width: 100%; 
+      height: 100%; 
+      cursor: pointer;
+    }
+    .upload-btn { position: relative; }
+    .upload-btn {
+      background: linear-gradient(90deg, #00d9ff, #00ff88);
+      color: #1a1a2e;
+      padding: 15px 40px;
+      border-radius: 30px;
+      cursor: pointer;
+      font-weight: bold;
+      font-size: 16px;
+      display: inline-block;
+      transition: transform 0.2s;
+    }
+    .upload-btn:hover { transform: scale(1.05); }
+    .file-list { 
+      background: rgba(255,255,255,0.05); 
+      border-radius: 16px; 
+      padding: 20px;
+    }
+    .file-list h2 { 
+      margin-bottom: 20px; 
+      color: #00d9ff;
+      font-size: 1.3em;
+    }
+    .file-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 15px;
+      background: rgba(255,255,255,0.03);
+      border-radius: 8px;
+      margin-bottom: 10px;
+      transition: background 0.2s;
+    }
+    .file-item:hover { background: rgba(255,255,255,0.08); }
+    .file-info { flex: 1; }
+    .file-name { font-weight: bold; margin-bottom: 5px; }
+    .file-meta { color: #888; font-size: 0.9em; }
+    .download-btn {
+      background: #00d9ff;
+      color: #1a1a2e;
+      padding: 8px 20px;
+      border-radius: 20px;
+      text-decoration: none;
+      font-weight: bold;
+      transition: transform 0.2s;
+    }
+    .download-btn:hover { transform: scale(1.05); }
+    .file-actions { display: flex; gap: 10px; align-items: center; }
+    .delete-btn {
+      background: #ff4757;
+      color: #fff;
+      border: none;
+      padding: 8px 15px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 0.9em;
+      transition: all 0.2s;
+    }
+    .delete-btn:hover { background: #ff6b81; }
+    .empty { 
+      text-align: center; 
+      color: #666; 
+      padding: 40px;
+    }
+    
+    /* 断点续传样式 */
+    .progress-container {
+      margin-top: 20px;
+      display: none;
+    }
+    .progress-container.active {
+      display: block;
+    }
+    .progress-bar-wrap {
+      background: rgba(255,255,255,0.1);
+      border-radius: 10px;
+      height: 20px;
+      overflow: hidden;
+      margin: 10px 0;
+    }
+    .progress-bar {
+      height: 100%;
+      background: linear-gradient(90deg, #00d9ff, #00ff88);
+      width: 0%;
+      transition: width 0.3s;
+    }
+    .progress-text {
+      color: #888;
+      font-size: 0.9em;
+    }
+    .upload-controls {
+      margin-top: 15px;
+    }
+    .upload-controls button {
+      background: #ff6b6b;
+      color: #fff;
+      border: none;
+      padding: 8px 20px;
+      border-radius: 20px;
+      cursor: pointer;
+      font-weight: bold;
+      margin: 0 5px;
+    }
+    .upload-controls button:hover {
+      opacity: 0.8;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>🚀 FUTURELAB SHARING BOX</h1>
+    <p class="subtitle">文件上传 · 随时随地 · 共享无限 · 断点续传</p>
+    
+    <div class="storage-info">
+      <span>💾 已用: ${formatSize(usedSpace)}</span>
+      <div class="storage-bar">
+        <div class="storage-bar-fill" style="width: ${(usedSpace / MAX_STORAGE * 100).toFixed(1)}%"></div>
+      </div>
+      <span>📦 剩余: ${formatSize(remainingSpace)} / 10GB</span>
+    </div>
+    
+    <div class="upload-box ${remainingSpace <= 0 ? 'disabled' : ''}" id="uploadBox">
+      <form id="uploadForm">
+        <label class="upload-btn">
+          📤 选择文件上传
+          <input type="file" name="file" id="fileInput">
+        </label>
+        <p style="margin-top: 15px; color: #888;">支持任意文件类型，单个文件最大 2GB，总空间 10GB<br>支持断点续传，刷新页面可继续上传</p>
+      </form>
+      <div id="uploadStatus" style="margin-top: 20px;"></div>
+      
+      <div class="progress-container" id="progressContainer">
+        <div class="progress-text" id="progressText">准备上传...</div>
+        <div class="progress-bar-wrap">
+          <div class="progress-bar" id="progressBar"></div>
+        </div>
+        <div class="upload-controls">
+          <button id="pauseBtn" style="display:none;">⏸ 暂停</button>
+          <button id="resumeBtn" style="display:none;">▶️ 继续</button>
+          <button id="cancelBtn">❌ 取消</button>
+        </div>
+      </div>
+    </div>
+    
+    <div class="file-list">
+      <h2>📁 已共享文件 (<span id="fileCount">${files.length}</span>)</h2>
+      ${files.length === 0 ? '<p class="empty">暂无文件，快来上传第一个吧！</p>' : ''}
+      ${files.map(f => `
+        <div class="file-item">
+          <div class="file-info">
+            <div class="file-name">${f.name}</div>
+            <div class="file-meta">${f.size} · ${f.date}</div>
+          </div>
+          <div class="file-actions">
+            <a href="${f.url}" class="download-btn" download>⬇️ 下载</a>
+            <button class="delete-btn" onclick="deleteFile('${f.name}')">🗑️ 删除</button>
+          </div>
+        </div>
+      `).join('')}
+    </div>
+  </div>
+  
+  <script>
+    // 格式化文件大小
+    function formatSize(bytes) {
+      if (bytes === 0) return '0 B';
+      const k = 1024;
+      const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+      const i = Math.floor(Math.log(bytes) / Math.log(k));
+      return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+    }
+    
+    const fileInput = document.getElementById('fileInput');
+    const uploadStatus = document.getElementById('uploadStatus');
+    const progressContainer = document.getElementById('progressContainer');
+    const progressBar = document.getElementById('progressBar');
+    const progressText = document.getElementById('progressText');
+    const pauseBtn = document.getElementById('pauseBtn');
+    const resumeBtn = document.getElementById('resumeBtn');
+    const cancelBtn = document.getElementById('cancelBtn');
+    
+    let currentFile = null;
+    let xhr = null; // 用于取消上传
+    
+    // 删除文件
+    async function deleteFile(filename) {
+      if (!confirm('确定要删除 ' + filename + ' 吗？此操作不可恢复！')) return;
+      
+      try {
+        const res = await fetch('/delete/' + encodeURIComponent(filename), { method: 'DELETE' });
+        const result = await res.json();
+        if (result.success) {
+          alert('✅ 文件已删除');
+          location.reload();
+        } else {
+          alert('❌ 删除失败: ' + result.error);
+        }
+      } catch (err) {
+        alert('❌ 删除失败: ' + err.message);
+      }
+    }
+    
+    // 更新进度条
+    function updateProgress(percent, text) {
+      progressBar.style.width = percent + '%';
+      progressText.textContent = text;
+    }
+    
+    // 简单上传函数
+    function uploadFile(file) {
+      return new Promise((resolve, reject) => {
+        xhr = new XMLHttpRequest();
+        
+        // 进度事件
+        xhr.upload.onprogress = function(e) {
+          if (e.lengthComputable) {
+            const percent = Math.round((e.loaded / e.total) * 100);
+            updateProgress(percent, '上传中... ' + percent + '% (' + formatSize(e.loaded) + ' / ' + formatSize(e.total) + ')');
+          }
+        };
+        
+        // 上传完成
+        xhr.onload = function() {
+          if (xhr.status >= 200 && xhr.status < 300) {
+            try {
+              const result = JSON.parse(xhr.responseText);
+              resolve(result);
+            } catch(e) {
+              resolve({success: true});
+            }
+          } else {
+            reject(new Error('上传失败: ' + xhr.status));
+          }
+        };
+        
+        // 上传错误
+        xhr.onerror = function() {
+          reject(new Error('网络错误'));
+        };
+        
+        // 发送表单数据
+        const formData = new FormData();
+        formData.append('file', file);
+        
+        xhr.open('POST', '/upload');
+        xhr.send(formData);
+      });
+    }
+    
+    // 文件选择事件
+    fileInput.addEventListener('change', function(e) {
+      const file = e.target.files[0];
+      if (!file) return;
+      
+      // 确认弹窗
+      var confirmed = confirm('确认上传文件：\n\n' + file.name + '\n大小：' + formatSize(file.size));
+      if (!confirmed) {
+        fileInput.value = '';
+        return;
+      }
+      
+      // 显示进度条
+      progressContainer.classList.add('active');
+      pauseBtn.style.display = 'none';
+      resumeBtn.style.display = 'none';
+      cancelBtn.style.display = 'inline-block';
+      
+      uploadStatus.innerHTML = '⏳ 准备上传...';
+      updateProgress(0, '0%');
+      
+      // 开始上传
+      uploadFile(file).then(function(result) {
+        if (result.success) {
+          uploadStatus.innerHTML = '✅ 上传成功！页面即将刷新...';
+          setTimeout(function() { location.reload(); }, 1500);
+        } else {
+          uploadStatus.innerHTML = '❌ ' + (result.error || '上传失败');
+        }
+      }).catch(function(err) {
+        uploadStatus.innerHTML = '❌ ' + err.message;
+      }).finally(function() {
+        cancelBtn.style.display = 'none';
+        fileInput.value = '';
+      });
+    });
+    
+    // 取消按钮
+    cancelBtn.addEventListener('click', function() {
+      if (xhr) {
+        xhr.abort();
+        xhr = null;
+      }
+      progressContainer.classList.remove('active');
+      uploadStatus.innerHTML = '❌ 已取消上传';
+      fileInput.value = '';
+      cancelBtn.style.display = 'none';
+    });
+  </script>
+</body>
+</html>`;
+  
+  res.send(html);
+});
+
+// 上传接口 (兼容旧版，需要登录)
+app.post('/upload', requireAuth, upload.single('file'), (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: '没有文件' });
+  }
+  
+  // 检查存储空间
+  if (!hasSpace(req.file.size)) {
+    // 删除刚上传的文件
+    fs.unlinkSync(path.join(__dirname, 'uploads', req.file.filename));
+    return res.status(507).json({ error: '存储空间不足，当前剩余: ' + formatSize(MAX_STORAGE - getUsedSpace()) });
+  }
+  
+  res.json({ success: true, filename: req.file.filename });
+});
+
+// 下载统计
+app.get('/stats', requireAuth, (req, res) => {
+  const uploadsDir = path.join(__dirname, 'uploads');
+  const files = fs.readdirSync(uploadsDir);
+  res.json({ totalFiles: files.length });
+});
+
+// 删除文件
+app.delete('/delete/:filename', requireAuth, (req, res) => {
+  const filename = req.params.filename;
+  const filePath = path.join(__dirname, 'uploads', filename);
+  
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({ error: '文件不存在' });
+  }
+  
+  try {
+    fs.unlinkSync(filePath);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 FUTURELAB SHARING BOX running on http://0.0.0.0:${PORT}`);
+  console.log(`📦 支持断点续传 - 分片大小: 5MB`);
+});
