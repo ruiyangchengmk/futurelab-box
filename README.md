@@ -47,10 +47,21 @@ npm start
 
 服务将在 http://localhost:8080 启动
 
+### 使用 systemd 部署
+
+```bash
+sudo cp deploy/futurelab-box.service /etc/systemd/system/futurelab-box.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now futurelab-box.service
+```
+
+生产环境请在服务器的 `/home/ubuntu/futurelab-box/.runtime.env` 中配置 `ACCESS_PASSWORD`、`SESSION_SECRET` 等运行变量，并设置为 `600` 权限。
+
 ### 使用 PM2 部署
 
 ```bash
-pm2 start ecosystem.config.js --env production
+pm2 start ecosystem.config.js
+pm2 save
 ```
 
 ## 📁 项目结构

@@ -1,0 +1,19 @@
+[Unit]
+Description=FutureLab shared file box
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/futurelab-box
+EnvironmentFile=/home/ubuntu/futurelab-box/.runtime.env
+ExecStart=/usr/bin/node /home/ubuntu/futurelab-box/index.js
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/home/ubuntu/futurelab-box/uploads /home/ubuntu/futurelab-box/temp_chunks
+
+[Install]
+WantedBy=multi-user.target
