@@ -1,0 +1,6 @@
+[Unit]
+Description=Check FutureLab shared file box health
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/futurelab-box-healthcheck

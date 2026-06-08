@@ -1,6 +1,7 @@
 [Unit]
 Description=FutureLab shared file box
-After=network.target
+Wants=network-online.target
+After=network-online.target
 
 [Service]
 Type=simple
@@ -9,7 +10,11 @@ WorkingDirectory=/home/ubuntu/futurelab-box
 EnvironmentFile=/home/ubuntu/futurelab-box/.runtime.env
 ExecStart=/usr/bin/node /home/ubuntu/futurelab-box/index.js
 Restart=always
-RestartSec=3
+RestartSec=2
+StartLimitIntervalSec=0
+TimeoutStopSec=20
+KillSignal=SIGINT
+LimitNOFILE=65535
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full

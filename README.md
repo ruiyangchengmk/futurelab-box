@@ -51,8 +51,12 @@ npm start
 
 ```bash
 sudo cp deploy/futurelab-box.service /etc/systemd/system/futurelab-box.service
+sudo cp deploy/futurelab-box-healthcheck.service /etc/systemd/system/futurelab-box-healthcheck.service
+sudo cp deploy/futurelab-box-healthcheck.timer /etc/systemd/system/futurelab-box-healthcheck.timer
+sudo install -m 755 deploy/futurelab-box-healthcheck.sh /usr/local/bin/futurelab-box-healthcheck
 sudo systemctl daemon-reload
 sudo systemctl enable --now futurelab-box.service
+sudo systemctl enable --now futurelab-box-healthcheck.timer
 ```
 
 生产环境请在服务器的 `/home/ubuntu/futurelab-box/.runtime.env` 中配置 `ACCESS_PASSWORD`、`SESSION_SECRET` 等运行变量，并设置为 `600` 权限。
