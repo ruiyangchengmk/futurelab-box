@@ -1,6 +1,5 @@
 const express = require('express');
 const multer = require('multer');
-const cors = require('cors');
 const cookieParser = require('cookie-parser');
 const fs = require('fs');
 const path = require('path');
@@ -8,22 +7,32 @@ const crypto = require('crypto');
 const { pipeline } = require('stream/promises');
 
 const app = express();
-const PORT = 8080;
-const ACCESS_PASSWORD = 'byd123';
-const MAX_STORAGE = 10 * 1024 * 1024 * 1024; // 10GB
+const PORT = Number(process.env.PORT || 8080);
+const ACCESS_PASSWORD = process.env.ACCESS_PASSWORD;
+const SESSION_SECRET = process.env.SESSION_SECRET;
+const COOKIE_NAME = 'futurelab_auth';
+const COOKIE_MAX_AGE = 24 * 60 * 60 * 1000;
+const MAX_STORAGE = Number(process.env.MAX_STORAGE_BYTES || 10 * 1024 * 1024 * 1024); // 10GB
+const MAX_FILE_SIZE = Number(process.env.MAX_FILE_BYTES || 500 * 1024 * 1024); // 500MB
 const CHUNK_SIZE = 5 * 1024 * 1024; // 每块5MB
-const TEMP_DIR = path.join(__dirname, 'temp_chunks');
+const UPLOAD_DIR = path.resolve(process.env.UPLOAD_DIR || path.join(__dirname, 'uploads'));
+const TEMP_DIR = path.resolve(process.env.TEMP_DIR || path.join(__dirname, 'temp_chunks'));
+
+if (!ACCESS_PASSWORD || !SESSION_SECRET) {
+  console.error('请设置 ACCESS_PASSWORD 和 SESSION_SECRET 环境变量后再启动服务。');
+  process.exit(1);
+}
 
 // 中间件
-app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 app.use(cookieParser());
-app.use(express.static('uploads'));
 
-// 确保临时目录存在
-if (!fs.existsSync(TEMP_DIR)) {
-  fs.mkdirSync(TEMP_DIR, { recursive: true });
+// 确保数据目录存在
+for (const dir of [UPLOAD_DIR, TEMP_DIR]) {
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
 }
 
 // 清理超过24小时的临时文件
@@ -49,18 +58,146 @@ cleanupOldChunks();
 function generateSafeFilename(originalName) {
   const timestamp = Date.now();
   const random = crypto.randomBytes(4).toString('hex');
-  const ext = path.extname(originalName);
-  return `${timestamp}-${random}${ext}`;
+  const basename = path.basename(originalName || 'file');
+  const encodedName = Buffer.from(basename).toString('base64url');
+  return `${timestamp}-${random}-${encodedName}`;
+}
+
+function getOriginalFilename(storedName) {
+  const parts = String(storedName).split('-');
+  if (parts.length < 3) return storedName;
+
+  const encodedName = parts.slice(2).join('-');
+  for (const encoding of ['base64url', 'base64']) {
+    try {
+      const decoded = Buffer.from(encodedName, encoding).toString('utf8');
+      if (decoded && decoded === path.basename(decoded)) {
+        return decoded;
+      }
+    } catch (err) {}
+  }
+
+  return storedName;
+}
+
+function hashValue(value) {
+  return crypto.createHash('sha256').update(String(value)).digest();
+}
+
+function passwordsMatch(candidate) {
+  return crypto.timingSafeEqual(hashValue(candidate || ''), hashValue(ACCESS_PASSWORD));
+}
+
+function sign(value) {
+  return crypto.createHmac('sha256', SESSION_SECRET).update(value).digest('base64url');
+}
+
+function createAuthToken() {
+  const payload = Buffer.from(JSON.stringify({ exp: Date.now() + COOKIE_MAX_AGE })).toString('base64url');
+  return `${payload}.${sign(payload)}`;
+}
+
+function verifyAuthToken(token) {
+  if (!token || typeof token !== 'string') return false;
+  const parts = token.split('.');
+  if (parts.length !== 2) return false;
+
+  const [payload, signature] = parts;
+  const expected = sign(payload);
+  const providedBuffer = Buffer.from(signature);
+  const expectedBuffer = Buffer.from(expected);
+  if (providedBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(providedBuffer, expectedBuffer)) {
+    return false;
+  }
+
+  try {
+    const data = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+    return Number.isFinite(data.exp) && data.exp > Date.now();
+  } catch (err) {
+    return false;
+  }
+}
+
+function setAuthCookie(res) {
+  res.cookie(COOKIE_NAME, createAuthToken(), {
+    maxAge: COOKIE_MAX_AGE,
+    httpOnly: true,
+    sameSite: 'strict',
+    secure: process.env.COOKIE_SECURE === 'true',
+    path: '/'
+  });
+}
+
+function isAuthenticated(req) {
+  return verifyAuthToken(req.cookies && req.cookies[COOKIE_NAME]);
+}
+
+function requireAuth(req, res, next) {
+  if (!isAuthenticated(req)) {
+    return res.status(401).json({ error: '未登录' });
+  }
+  next();
+}
+
+function getUploadFilePath(filename) {
+  if (!filename || typeof filename !== 'string') return null;
+  const filePath = path.resolve(UPLOAD_DIR, filename);
+  if (!filePath.startsWith(UPLOAD_DIR + path.sep)) return null;
+  return filePath;
+}
+
+function getChunkDir(uploadId) {
+  if (!/^[a-f0-9]{32}$/.test(uploadId || '')) return null;
+  const chunkDir = path.resolve(TEMP_DIR, uploadId);
+  if (!chunkDir.startsWith(TEMP_DIR + path.sep)) return null;
+  return chunkDir;
+}
+
+function getUsedStorageBytes() {
+  if (!fs.existsSync(UPLOAD_DIR)) return 0;
+  return fs.readdirSync(UPLOAD_DIR).reduce((total, filename) => {
+    const filepath = getUploadFilePath(filename);
+    if (!filepath) return total;
+    const stats = fs.statSync(filepath);
+    return stats.isFile() ? total + stats.size : total;
+  }, 0);
+}
+
+function listUploadedFiles() {
+  if (!fs.existsSync(UPLOAD_DIR)) return [];
+  return fs.readdirSync(UPLOAD_DIR)
+    .map(filename => {
+      const filepath = getUploadFilePath(filename);
+      if (!filepath) return null;
+      const stats = fs.statSync(filepath);
+      if (!stats.isFile()) return null;
+      return {
+        name: getOriginalFilename(filename),
+        filename,
+        size: stats.size,
+        displaySize: formatSize(stats.size),
+        date: stats.mtime.toLocaleString('zh-CN'),
+        mtimeMs: stats.mtimeMs
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.mtimeMs - a.mtimeMs)
+    .map(({ mtimeMs, ...file }) => file);
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 // 存储配置
 const storage = multer.diskStorage({
   destination: function (req, file, cb) {
-    const uploadsDir = path.join(__dirname, 'uploads');
-    if (!fs.existsSync(uploadsDir)) {
-      fs.mkdirSync(uploadsDir, { recursive: true });
-    }
-    cb(null, uploadsDir);
+    cb(null, UPLOAD_DIR);
   },
   filename: function (req, file, cb) {
     const safeName = generateSafeFilename(file.originalname);
@@ -71,10 +208,19 @@ const storage = multer.diskStorage({
 const upload = multer({ 
   storage: storage,
   limits: {
-    fileSize: 500 * 1024 * 1024,
+    fileSize: MAX_FILE_SIZE,
     timeout: 1800 * 1000
   }
 });
+
+const chunkUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: CHUNK_SIZE + 1024 * 1024,
+    files: 1,
+    fields: 1
+  }
+}).any();
 
 // 禁用请求超时
 app.use((req, res, next) => {
@@ -91,9 +237,20 @@ app.post('/upload/init', (req, res) => {
     return res.status(401).json({ error: '未登录' });
   }
   
-  const { filename, filesize, chunkSize = CHUNK_SIZE } = req.body;
-  if (!filename || !filesize) {
+  const { filename } = req.body;
+  const filesize = Number(req.body.filesize);
+  const chunkSize = Number(req.body.chunkSize || CHUNK_SIZE);
+  if (!filename || !Number.isInteger(filesize) || filesize <= 0 || !Number.isInteger(chunkSize) || chunkSize <= 0) {
     return res.status(400).json({ error: '缺少参数' });
+  }
+  if (filesize > MAX_FILE_SIZE) {
+    return res.status(400).json({ error: `单个文件最大支持 ${formatSize(MAX_FILE_SIZE)}` });
+  }
+  if (chunkSize > CHUNK_SIZE) {
+    return res.status(400).json({ error: `分片最大支持 ${formatSize(CHUNK_SIZE)}` });
+  }
+  if (getUsedStorageBytes() + filesize > MAX_STORAGE) {
+    return res.status(400).json({ error: `空间不足，当前上限 ${formatSize(MAX_STORAGE)}` });
   }
   
   const uploadId = crypto.randomBytes(16).toString('hex');
@@ -118,15 +275,17 @@ app.post('/upload/chunk/:uploadId', (req, res) => {
   }
   
   const { uploadId } = req.params;
-  const chunkDir = path.join(TEMP_DIR, uploadId);
+  const chunkDir = getChunkDir(uploadId);
+  if (!chunkDir) {
+    return res.status(400).json({ error: '上传 ID 无效' });
+  }
   const infoPath = path.join(chunkDir, 'info.json');
   
   if (!fs.existsSync(infoPath)) {
     return res.status(404).json({ error: '上传不存在或已过期' });
   }
   
-  const upload = multer({ storage: multer.memoryStorage() }).any();
-  upload(req, res, function(err) {
+  chunkUpload(req, res, function(err) {
     if (err) {
       return res.status(500).json({ error: '分片上传失败: ' + err.message });
     }
@@ -137,11 +296,18 @@ app.post('/upload/chunk/:uploadId', (req, res) => {
       return res.status(400).json({ error: '缺少 chunkIndex 参数' });
     }
     chunkIndex = parseInt(chunkIndex, 10);
+    const info = JSON.parse(fs.readFileSync(infoPath, 'utf8'));
+    if (!Number.isInteger(chunkIndex) || chunkIndex < 0 || chunkIndex >= info.totalChunks) {
+      return res.status(400).json({ error: 'chunkIndex 无效' });
+    }
     
     // 找到上传的文件
     const chunkFile = req.files && req.files.find(f => f.fieldname === 'chunk');
     if (!chunkFile) {
       return res.status(400).json({ error: '没有分片文件' });
+    }
+    if (chunkFile.size > info.chunkSize) {
+      return res.status(400).json({ error: '分片大小超过限制' });
     }
     
     const chunkPath = path.join(chunkDir, `chunk_${chunkIndex}`);
@@ -158,7 +324,10 @@ app.get('/upload/status/:uploadId', (req, res) => {
   }
   
   const { uploadId } = req.params;
-  const chunkDir = path.join(TEMP_DIR, uploadId);
+  const chunkDir = getChunkDir(uploadId);
+  if (!chunkDir) {
+    return res.status(400).json({ error: '上传 ID 无效' });
+  }
   const infoPath = path.join(chunkDir, 'info.json');
   
   if (!fs.existsSync(infoPath)) {
@@ -185,7 +354,10 @@ app.post('/upload/complete/:uploadId', async (req, res) => {
   }
   
   const { uploadId } = req.params;
-  const chunkDir = path.join(TEMP_DIR, uploadId);
+  const chunkDir = getChunkDir(uploadId);
+  if (!chunkDir) {
+    return res.status(400).json({ error: '上传 ID 无效' });
+  }
   const infoPath = path.join(chunkDir, 'info.json');
   
   if (!fs.existsSync(infoPath)) {
@@ -193,9 +365,11 @@ app.post('/upload/complete/:uploadId', async (req, res) => {
   }
   
   const info = JSON.parse(fs.readFileSync(infoPath, 'utf8'));
-  const uploadsDir = path.join(__dirname, 'uploads');
   const safeName = generateSafeFilename(info.originalName);
-  const finalPath = path.join(uploadsDir, safeName);
+  const finalPath = path.join(UPLOAD_DIR, safeName);
+  if (getUsedStorageBytes() + Number(info.filesize) > MAX_STORAGE) {
+    return res.status(400).json({ error: `空间不足，当前上限 ${formatSize(MAX_STORAGE)}` });
+  }
   
   // 检查所有分片是否存在
   for (let i = 0; i < info.totalChunks; i++) {
@@ -238,11 +412,6 @@ app.post('/upload/complete/:uploadId', async (req, res) => {
 
 // ============ 原有 API ============
 
-// 登录验证
-function isAuthenticated(req) {
-  return req.cookies && req.cookies.authorized === 'true';
-}
-
 // 登录页面
 app.get('/login', (req, res) => {
   const html = `
@@ -256,26 +425,35 @@ app.get('/login', (req, res) => {
     .login { background: #16213e; padding: 40px; border-radius: 10px; text-align: center; }
     input { padding: 10px; margin: 10px 0; border-radius: 5px; border: none; }
     button { padding: 10px 30px; background: #00d9ff; border: none; border-radius: 5px; cursor: pointer; }
+    .error { color: #ff7a85; min-height: 24px; margin-top: 10px; }
   </style>
 </head>
 <body>
   <div class="login">
     <h1>FutureLab 文件共享</h1>
     <form id="loginForm">
-      <input type="password" id="password" placeholder="请输入密码" required>
+      <input type="password" id="password" name="password" placeholder="请输入密码" required>
       <br>
       <button type="submit">登录</button>
     </form>
+    <div id="error" class="error"></div>
   </div>
   <script>
     document.getElementById('loginForm').onsubmit = function(e) {
       e.preventDefault();
-      if (document.getElementById('password').value === '${ACCESS_PASSWORD}') {
-        document.cookie = 'authorized=true; path=/';
-        location.href = '/';
-      } else {
-        alert('密码错误');
-      }
+      var error = document.getElementById('error');
+      error.textContent = '';
+      fetch('/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: document.getElementById('password').value })
+      })
+        .then(function(res) {
+          if (!res.ok) throw new Error('密码错误');
+          return res.json();
+        })
+        .then(function() { location.href = '/'; })
+        .catch(function(err) { error.textContent = err.message; });
     };
   </script>
 </body>
@@ -289,8 +467,8 @@ app.get('/check', (req, res) => {
 
 app.post('/login', (req, res) => {
   const password = req.body.password;
-  if (password === ACCESS_PASSWORD) {
-    res.cookie('authorized', 'true', { maxAge: 24 * 60 * 60 * 1000, path: '/' });
+  if (passwordsMatch(password)) {
+    setAuthCookie(res);
     res.json({ success: true });
   } else {
     res.status(401).json({ error: '密码错误' });
@@ -302,36 +480,33 @@ app.get('/files', (req, res) => {
     return res.status(401).json({ error: '未登录' });
   }
   
-  const uploadsDir = path.join(__dirname, 'uploads');
-  if (!fs.existsSync(uploadsDir)) {
-    return res.json([]);
-  }
-  
-  const files = fs.readdirSync(uploadsDir).map(filename => {
-    const filepath = path.join(uploadsDir, filename);
-    const stats = fs.statSync(filepath);
-    return {
-      name: filename,
-      filename: filename,
-      size: stats.size,
-      date: stats.mtime.toLocaleString('zh-CN')
-    };
-  });
-  
-  res.json(files);
+  res.json(listUploadedFiles());
 });
 
 // 单文件上传（保留小文件快速上传）
-app.post('/upload', upload.single('file'), (req, res) => {
-  if (!isAuthenticated(req)) {
-    return res.status(401).json({ error: '未登录' });
-  }
-  
+app.post('/upload', requireAuth, upload.single('file'), (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: '没有文件' });
   }
+  if (getUsedStorageBytes() > MAX_STORAGE) {
+    fs.unlinkSync(req.file.path);
+    return res.status(400).json({ error: `空间不足，当前上限 ${formatSize(MAX_STORAGE)}` });
+  }
   
   res.json({ success: true, filename: req.file.filename });
+});
+
+app.get('/download/:filename', (req, res) => {
+  if (!isAuthenticated(req)) {
+    return res.status(401).json({ error: '未登录' });
+  }
+
+  const filepath = getUploadFilePath(req.params.filename);
+  if (!filepath || !fs.existsSync(filepath)) {
+    return res.status(404).json({ error: '文件不存在' });
+  }
+
+  res.download(filepath, getOriginalFilename(req.params.filename));
 });
 
 app.delete('/delete/:filename', (req, res) => {
@@ -339,10 +514,9 @@ app.delete('/delete/:filename', (req, res) => {
     return res.status(401).json({ error: '未登录' });
   }
   
-  const filename = req.params.filename;
-  const filepath = path.join(__dirname, 'uploads', filename);
+  const filepath = getUploadFilePath(req.params.filename);
   
-  if (!fs.existsSync(filepath)) {
+  if (!filepath || !fs.existsSync(filepath)) {
     return res.status(404).json({ error: '文件不存在' });
   }
   
@@ -359,20 +533,7 @@ app.get('/', (req, res) => {
     return res.redirect('/login');
   }
   
-  const uploadsDir = path.join(__dirname, 'uploads');
-  let files = [];
-  if (fs.existsSync(uploadsDir)) {
-    files = fs.readdirSync(uploadsDir).map(filename => {
-      const filepath = path.join(uploadsDir, filename);
-      const stats = fs.statSync(filepath);
-      return {
-        name: filename,
-        filename: filename,
-        size: formatSize(stats.size),
-        date: stats.mtime.toLocaleString('zh-CN')
-      };
-    });
-  }
+  const files = listUploadedFiles();
   
   const html = `
 <!DOCTYPE html>
@@ -437,11 +598,11 @@ app.get('/', (req, res) => {
         ${files.map(f => `
         <div class="file-item">
           <div class="file-info">
-            <div class="file-name">${f.name}</div>
-            <div class="file-meta">${f.size} · ${f.date}</div>
+            <div class="file-name">${escapeHtml(f.name)}</div>
+            <div class="file-meta">${escapeHtml(f.displaySize)} · ${escapeHtml(f.date)}</div>
           </div>
           <div class="file-actions">
-            <a href="/${encodeURIComponent(f.filename)}" class="btn btn-download" download="${f.name}">⬇️ 下载</a>
+            <a href="/download/${encodeURIComponent(f.filename)}" class="btn btn-download" download="${escapeHtml(f.name)}">⬇️ 下载</a>
             <button class="btn btn-delete" onclick="deleteFile('${encodeURIComponent(f.filename)}')">🗑️ 删除</button>
           </div>
         </div>
@@ -489,6 +650,7 @@ app.get('/', (req, res) => {
         body: JSON.stringify({ filename: file.name, filesize: file.size, chunkSize: chunkSize })
       });
       var initData = await initRes.json();
+      if (!initRes.ok) throw new Error(initData.error || '初始化上传失败');
       uploadId = initData.uploadId;
       totalChunks = initData.totalChunks;
       chunkSize = initData.chunkSize;
@@ -505,7 +667,6 @@ app.get('/', (req, res) => {
       // 上传每个分片
       for (var i = 0; i < totalChunks; i++) {
         if (uploadedChunks.has(i)) {
-          completedChunks++;
           continue; // 跳过已上传
         }
         
@@ -548,6 +709,7 @@ app.get('/', (req, res) => {
       showStatus('合并文件中...', 'info');
       var completeRes = await fetch('/upload/complete/' + uploadId, { method: 'POST' });
       var completeData = await completeRes.json();
+      if (!completeRes.ok) throw new Error(completeData.error || '合并文件失败');
       
       if (completeData.success) {
         showStatus('✓ 上传成功！', 'success');
@@ -631,6 +793,19 @@ app.get('/', (req, res) => {
 </html>`;
   
   res.send(html);
+});
+
+app.use((err, req, res, next) => {
+  if (err instanceof multer.MulterError) {
+    return res.status(400).json({ error: err.message });
+  }
+
+  next(err);
+});
+
+app.use((err, req, res, next) => {
+  console.error('请求处理失败:', err);
+  res.status(500).json({ error: '服务器错误' });
 });
 
 function formatSize(bytes) {

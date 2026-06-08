@@ -5,11 +5,11 @@
 ## 🌐 在线访问
 
 - **网址**: http://49.234.51.29:8080
-- **密码**: `byd123`
+- **访问密码**: 通过服务器环境变量 `ACCESS_PASSWORD` 配置，不写入仓库
 
 ## ✨ 功能特性
 
-- 🔐 **密码保护** - 简单的 cookie-based 认证
+- 🔐 **密码保护** - 服务端校验密码，使用 HttpOnly 签名 cookie
 - 📤 **大文件上传** - 支持最大 500MB 文件
 - 🔄 **断点续传** - 大于 10MB 的文件自动分片上传，支持断点续传
 - 📊 **上传进度** - 实时显示上传进度和速度
@@ -31,10 +31,18 @@
 npm install
 ```
 
+### 配置环境变量
+
+```bash
+export SESSION_SECRET="$(openssl rand -hex 32)"
+```
+
+`ACCESS_PASSWORD` 请只在服务器环境或 PM2 配置中设置，不要写入仓库文档。
+
 ### 启动服务
 
 ```bash
-node index.js
+npm start
 ```
 
 服务将在 http://localhost:8080 启动
@@ -42,7 +50,7 @@ node index.js
 ### 使用 PM2 部署
 
 ```bash
-pm2 start index.js --name futurelab-box
+pm2 start ecosystem.config.js --env production
 ```
 
 ## 📁 项目结构
@@ -58,14 +66,17 @@ futurelab-box/
 
 ## 🔧 配置说明
 
-在 `index.js` 中可以修改以下配置：
+通过环境变量配置服务：
 
-```javascript
-const PORT = 8080;                    // 服务端口
-const ACCESS_PASSWORD = 'byd123';     // 访问密码
-const MAX_STORAGE = 10 * 1024 * 1024 * 1024;  // 最大存储 10GB
-const CHUNK_SIZE = 5 * 1024 * 1024;   // 分片大小 5MB
-```
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `PORT` | `8080` | 服务端口 |
+| `ACCESS_PASSWORD` | 无 | 必填，访问密码 |
+| `SESSION_SECRET` | 无 | 必填，cookie 签名密钥 |
+| `UPLOAD_DIR` | `./uploads` | 文件存储目录 |
+| `TEMP_DIR` | `./temp_chunks` | 分片临时目录 |
+| `MAX_STORAGE_BYTES` | `10737418240` | 最大存储 10GB |
+| `MAX_FILE_BYTES` | `524288000` | 单文件最大 500MB |
 
 ## 📝 API 接口
 
@@ -110,10 +121,10 @@ DELETE /delete/:filename
 A: 大于 10MB 的文件会自动使用分片上传，如果中断可以重新选择同一文件继续上传。
 
 **Q: 如何修改密码？**
-A: 修改 `index.js` 中的 `ACCESS_PASSWORD` 常量。
+A: 修改服务器环境变量 `ACCESS_PASSWORD` 并重启 PM2 进程。
 
 **Q: 如何更改端口？**
-A: 修改 `index.js` 中的 `PORT` 常量，并确保防火墙放行该端口。
+A: 设置环境变量 `PORT`，并确保防火墙放行该端口。
 
 ## 📄 许可证
 
