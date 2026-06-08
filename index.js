@@ -17,6 +17,7 @@ const MAX_FILE_SIZE = Number(process.env.MAX_FILE_BYTES || 500 * 1024 * 1024); /
 const CHUNK_SIZE = 5 * 1024 * 1024; // 每块5MB
 const UPLOAD_DIR = path.resolve(process.env.UPLOAD_DIR || path.join(__dirname, 'uploads'));
 const TEMP_DIR = path.resolve(process.env.TEMP_DIR || path.join(__dirname, 'temp_chunks'));
+const METADATA_FILE = path.join(UPLOAD_DIR, '.metadata.json');
 
 if (!ACCESS_PASSWORD || !SESSION_SECRET) {
   console.error('请设置 ACCESS_PASSWORD 和 SESSION_SECRET 环境变量后再启动服务。');
@@ -58,9 +59,26 @@ cleanupOldChunks();
 function generateSafeFilename(originalName) {
   const timestamp = Date.now();
   const random = crypto.randomBytes(4).toString('hex');
-  const basename = path.basename(originalName || 'file');
+  const basename = path.basename(normalizeOriginalName(originalName || 'file'));
   const encodedName = Buffer.from(basename).toString('base64url');
   return `${timestamp}-${random}-${encodedName}`;
+}
+
+function countCjk(value) {
+  const matches = String(value).match(/[\u3400-\u9fff]/g);
+  return matches ? matches.length : 0;
+}
+
+function normalizeOriginalName(originalName) {
+  const name = path.basename(String(originalName || 'file'));
+  const repaired = Buffer.from(name, 'latin1').toString('utf8');
+  const hasMojibakeControls = /[\u0080-\u009f]/.test(name);
+
+  if (!repaired.includes('�') && (hasMojibakeControls || countCjk(repaired) > countCjk(name))) {
+    return path.basename(repaired);
+  }
+
+  return name;
 }
 
 function getOriginalFilename(storedName) {
@@ -72,7 +90,7 @@ function getOriginalFilename(storedName) {
     try {
       const decoded = Buffer.from(encodedName, encoding).toString('utf8');
       if (decoded && decoded === path.basename(decoded)) {
-        return decoded;
+        return normalizeOriginalName(decoded);
       }
     } catch (err) {}
   }
@@ -141,6 +159,7 @@ function requireAuth(req, res, next) {
 
 function getUploadFilePath(filename) {
   if (!filename || typeof filename !== 'string') return null;
+  if (filename === path.basename(METADATA_FILE)) return null;
   const filePath = path.resolve(UPLOAD_DIR, filename);
   if (!filePath.startsWith(UPLOAD_DIR + path.sep)) return null;
   return filePath;
@@ -156,6 +175,7 @@ function getChunkDir(uploadId) {
 function getUsedStorageBytes() {
   if (!fs.existsSync(UPLOAD_DIR)) return 0;
   return fs.readdirSync(UPLOAD_DIR).reduce((total, filename) => {
+    if (filename === path.basename(METADATA_FILE)) return total;
     const filepath = getUploadFilePath(filename);
     if (!filepath) return total;
     const stats = fs.statSync(filepath);
@@ -163,21 +183,58 @@ function getUsedStorageBytes() {
   }, 0);
 }
 
+function loadMetadata() {
+  try {
+    if (!fs.existsSync(METADATA_FILE)) return {};
+    return JSON.parse(fs.readFileSync(METADATA_FILE, 'utf8'));
+  } catch (err) {
+    console.error('读取文件元数据失败:', err);
+    return {};
+  }
+}
+
+function saveMetadata(metadata) {
+  const tmpFile = `${METADATA_FILE}.tmp`;
+  fs.writeFileSync(tmpFile, JSON.stringify(metadata, null, 2));
+  fs.renameSync(tmpFile, METADATA_FILE);
+}
+
+function rememberUploadedFile(filename, originalName, size) {
+  const metadata = loadMetadata();
+  metadata[filename] = {
+    originalName: normalizeOriginalName(originalName || filename),
+    size,
+    uploadedAt: new Date().toISOString()
+  };
+  saveMetadata(metadata);
+}
+
+function forgetUploadedFile(filename) {
+  const metadata = loadMetadata();
+  if (!metadata[filename]) return;
+  delete metadata[filename];
+  saveMetadata(metadata);
+}
+
 function listUploadedFiles() {
   if (!fs.existsSync(UPLOAD_DIR)) return [];
+  const metadata = loadMetadata();
   return fs.readdirSync(UPLOAD_DIR)
     .map(filename => {
+      if (filename === path.basename(METADATA_FILE)) return null;
       const filepath = getUploadFilePath(filename);
       if (!filepath) return null;
       const stats = fs.statSync(filepath);
       if (!stats.isFile()) return null;
+      const fileMeta = metadata[filename] || {};
+      const uploadedAt = fileMeta.uploadedAt ? new Date(fileMeta.uploadedAt) : stats.mtime;
       return {
-        name: getOriginalFilename(filename),
+        name: fileMeta.originalName || getOriginalFilename(filename),
         filename,
-        size: stats.size,
-        displaySize: formatSize(stats.size),
-        date: stats.mtime.toLocaleString('zh-CN'),
-        mtimeMs: stats.mtimeMs
+        size: Number(fileMeta.size) || stats.size,
+        displaySize: formatSize(Number(fileMeta.size) || stats.size),
+        date: uploadedAt.toLocaleString('zh-CN'),
+        mtimeMs: uploadedAt.getTime()
       };
     })
     .filter(Boolean)
@@ -398,6 +455,7 @@ app.post('/upload/complete/:uploadId', async (req, res) => {
     
     // 清理临时文件
     fs.rmSync(chunkDir, { recursive: true });
+    rememberUploadedFile(safeName, info.originalName, Number(info.filesize));
     
     res.json({ success: true, filename: safeName, size: info.filesize });
   } catch (err) {
@@ -492,6 +550,7 @@ app.post('/upload', requireAuth, upload.single('file'), (req, res) => {
     fs.unlinkSync(req.file.path);
     return res.status(400).json({ error: `空间不足，当前上限 ${formatSize(MAX_STORAGE)}` });
   }
+  rememberUploadedFile(req.file.filename, req.file.originalname, req.file.size);
   
   res.json({ success: true, filename: req.file.filename });
 });
@@ -522,6 +581,7 @@ app.delete('/delete/:filename', (req, res) => {
   
   try {
     fs.unlinkSync(filepath);
+    forgetUploadedFile(req.params.filename);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -547,7 +607,8 @@ app.get('/', (req, res) => {
     body { font-family: -apple-system, Arial, sans-serif; background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); color: #fff; min-height: 100vh; padding: 20px; }
     h1 { text-align: center; margin-bottom: 30px; color: #00d9ff; }
     .container { max-width: 900px; margin: 0 auto; }
-    .upload-section { background: rgba(255,255,255,0.05); border: 2px dashed #00d9ff; border-radius: 16px; padding: 40px; text-align: center; margin-bottom: 30px; }
+    .upload-section { background: rgba(255,255,255,0.05); border: 2px dashed #00d9ff; border-radius: 16px; padding: 40px; text-align: center; margin-bottom: 30px; transition: background 0.2s, border-color 0.2s, transform 0.2s; }
+    .upload-section.drag-over { background: rgba(0,217,255,0.14); border-color: #00ff88; transform: translateY(-2px); }
     .upload-section h2 { color: #00d9ff; margin-bottom: 20px; }
     .progress { display: none; margin-top: 20px; }
     .progress-bar { background: #333; border-radius: 10px; height: 20px; overflow: hidden; }
@@ -559,7 +620,8 @@ app.get('/', (req, res) => {
     .file-item:last-child { border-bottom: none; }
     .file-info { flex: 1; overflow: hidden; }
     .file-name { font-weight: bold; word-break: break-all; }
-    .file-meta { color: #888; font-size: 0.9em; margin-top: 5px; }
+    .file-meta { color: #a9b7c6; font-size: 0.9em; margin-top: 8px; display: flex; gap: 14px; flex-wrap: wrap; }
+    .file-meta span { white-space: nowrap; }
     .file-actions { display: flex; gap: 10px; flex-shrink: 0; }
     .btn { padding: 8px 16px; border: none; border-radius: 8px; cursor: pointer; text-decoration: none; font-size: 14px; }
     .btn-download { background: #00d9ff; color: #1a1a2e; }
@@ -567,6 +629,7 @@ app.get('/', (req, res) => {
     #fileInput { display: none; }
     .upload-label { display: inline-block; background: linear-gradient(90deg, #00d9ff, #00ff88); color: #1a1a2e; padding: 15px 40px; border-radius: 30px; cursor: pointer; font-weight: bold; }
     .upload-label:hover { transform: scale(1.05); }
+    .drop-hint { color: #a9b7c6; margin-top: 14px; font-size: 0.95em; }
     .upload-status { margin-top: 15px; padding: 10px; border-radius: 8px; display: none; }
     .upload-status.error { background: rgba(255, 71, 87, 0.2); color: #ff4757; }
     .upload-status.success { background: rgba(0, 255, 136, 0.2); color: #00ff88; }
@@ -578,10 +641,11 @@ app.get('/', (req, res) => {
   <div class="container">
     <h1>📂 FutureLab 文件共享</h1>
     
-    <div class="upload-section">
+    <div class="upload-section" id="uploadSection">
       <h2>上传文件</h2>
       <label for="fileInput" class="upload-label">📤 选择文件</label>
       <input type="file" id="fileInput">
+      <div class="drop-hint">或把文件拖到这里上传</div>
       
       <div class="progress" id="progress">
         <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
@@ -599,7 +663,10 @@ app.get('/', (req, res) => {
         <div class="file-item">
           <div class="file-info">
             <div class="file-name">${escapeHtml(f.name)}</div>
-            <div class="file-meta">${escapeHtml(f.displaySize)} · ${escapeHtml(f.date)}</div>
+            <div class="file-meta">
+              <span>大小: ${escapeHtml(f.displaySize)}</span>
+              <span>上传时间: ${escapeHtml(f.date)}</span>
+            </div>
           </div>
           <div class="file-actions">
             <a href="/download/${encodeURIComponent(f.filename)}" class="btn btn-download" download="${escapeHtml(f.name)}">⬇️ 下载</a>
@@ -719,14 +786,12 @@ app.get('/', (req, res) => {
       }
     }
     
-    document.getElementById('fileInput').onchange = function(e) {
-      var file = e.target.files[0];
+    function startUpload(file) {
       if (!file) return;
       
       if (currentXhr) currentXhr.abort();
       
       if (!confirm('确认上传: ' + file.name + '\\n大小: ' + formatSize(file.size))) {
-        e.target.value = '';
         return;
       }
       
@@ -776,7 +841,59 @@ app.get('/', (req, res) => {
         currentXhr.timeout = 1800000;
         currentXhr.send(formData);
       }
+    }
+
+    document.getElementById('fileInput').onchange = function(e) {
+      var file = e.target.files[0];
+      startUpload(file);
+      e.target.value = '';
     };
+
+    var uploadSection = document.getElementById('uploadSection');
+    var dragDepth = 0;
+
+    function hasFiles(dataTransfer) {
+      return dataTransfer && Array.prototype.indexOf.call(dataTransfer.types || [], 'Files') !== -1;
+    }
+
+    function setDragOver(active) {
+      uploadSection.classList.toggle('drag-over', active);
+    }
+
+    ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(function(eventName) {
+      uploadSection.addEventListener(eventName, function(e) {
+        if (!hasFiles(e.dataTransfer)) return;
+        e.preventDefault();
+        e.stopPropagation();
+      });
+    });
+
+    uploadSection.addEventListener('dragenter', function(e) {
+      if (!hasFiles(e.dataTransfer)) return;
+      dragDepth++;
+      setDragOver(true);
+    });
+
+    uploadSection.addEventListener('dragover', function(e) {
+      if (!hasFiles(e.dataTransfer)) return;
+      e.dataTransfer.dropEffect = 'copy';
+    });
+
+    uploadSection.addEventListener('dragleave', function(e) {
+      if (!hasFiles(e.dataTransfer)) return;
+      dragDepth = Math.max(0, dragDepth - 1);
+      if (dragDepth === 0) setDragOver(false);
+    });
+
+    uploadSection.addEventListener('drop', function(e) {
+      if (!hasFiles(e.dataTransfer)) return;
+      dragDepth = 0;
+      setDragOver(false);
+      var files = e.dataTransfer.files;
+      if (files && files.length > 0) {
+        startUpload(files[0]);
+      }
+    });
     
     function deleteFile(filename) {
       if (!confirm('确定删除 ' + decodeURIComponent(filename) + ' ?')) return;
